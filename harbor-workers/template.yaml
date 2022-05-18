@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: SAM Template for Harbor Workers
+
+Transform: "AWS::Serverless-2016-10-31"
+
+Conditions:
+  CreateNonDevResources: !Not [!Equals [!Ref Environment, 'development']]
+  IsDevelopment: !Equals [!Ref Environment, 'development']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Mappings:
+  EFSAccessPoints:
+    development:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:723646754367:access-point/fsap-0ebaa5758e1b9f711
+    staging:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:703075173256:access-point/fsap-075ba46d019c2f9df
+    production:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:612422893098:access-point/fsap-0cdb40148dffb3c53
+  PrivSubnets:
+    development:
+      Subnet1: subnet-03e4097903948eed2
+      Subnet2: subnet-0f46e895695683b39
+    staging:
+      Subnet1: subnet-0dec2960e6589fa82
+      Subnet2: subnet-098597c2043c8721a
+    production:
+      Subnet1: subnet-01d593234f12a5b6d
+      Subnet2: subnet-081269219444d9522
+  PrivNATSubnets:
+    development:
+      Subnet1: subnet-09f5fa13c97ffcc8a
+      Subnet2: subnet-0814cdc8489cf2eae
+      Subnet1Large: subnet-017b90a035ebb96a9
+      Subnet2Large: subnet-09059c8d23c33f101
+    staging:
+      Subnet1: subnet-05688a431e6f1034c
+      Subnet2: subnet-04899d6c93ae8e8e5
+      Subnet1Large: subnet-0e749513831b924dd
+      Subnet2Large: subnet-0b6f9ea44f92c7d87
+    production:
+      Subnet1: subnet-0e75173d5a6ff5746
+      Subnet2: subnet-0cf5941eb658ad58e
+      Subnet1Large: subnet-054b0d6d76f10b27a
+      Subnet2Large: subnet-007d64664a23a79c7
+  SecurityGroups:
+    development:
+      EFS: sg-00478bcadabad640c
+      NAT: sg-08e4b82ffd2daa5f7
+      NAT2: sg-08e4b82ffd2daa5f7
+      RDS: sg-012f232f97bce976f
+      Redis: sg-0dfe80630b14340a6
+    staging:
+      EFS: sg-026d2e2ef75cbf7ee
+      NAT: sg-0d8bd51a2eb73f8dc
+      NAT2: sg-0d8bd51a2eb73f8dc
+      RDS: sg-0e13bc70e8acbcdca
+      Redis: sg-0da6a248f808afd9d
+    production:
+      EFS: sg-0aaa279858a710e39
+      NAT: sg-0634dd96462640292
+      NAT2: sg-07b6ff1b0e820468e
+      RDS: sg-0559c0492f0fa4e79
+      Redis: sg-0ea1ab313c828762c
+
+Parameters:
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Enter development, staging, or production. Default is development.
+
+Resources:
+  ProbSevereIngestFunction:
+    Condition: IsProduction
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: probsevere-ingest/
+      Description: Ingest latest NOAA ProbSevere data
+      Events:
+        Invoke:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0/2 * * * ? *)
+            Enabled: True
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub
+            - ${env}-noaa-probsevere-raw
+            - env: !Ref Environment
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: ProbSevereIngest
+      Handler: probsevere-ingest
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-noaa-probsevere-raw
+              - env: !Ref Environment
+      Runtime: go1.x
+      Timeout: 20
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  UpsertGeoIPFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: upsert-geoip/
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub
+            - ${env}-maxmind-db
+            - env: !Ref Environment
+          LICENSE_KEY: "{{resolve:ssm:MAXMIND_LICENSE_KEY:1}}"
+      FileSystemConfigs:
+        - Arn: !FindInMap [EFSAccessPoints, !Ref Environment, PrivNatLarge]
+          LocalMountPath: "/mnt/efs"
+      FunctionName: UpsertGeoIP
+      Handler: upsert-geoip
+      MemorySize: 1024
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - DynamoDBReadPolicy:
+            TableName: geoip_db_version
+        - DynamoDBWritePolicy:
+            TableName: geoip_db_version
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-maxmind-db
+              - env: !Ref Environment
+        - AmazonElasticFileSystemClientFullAccess
+      Runtime: go1.x
+      Timeout: 300
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+            - !FindInMap [SecurityGroups, !Ref Environment, EFS]
+            - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+            - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  InvokeUpsertGeoIPFunction:
+    Condition: CreateNonDevResources
+    Type: AWS::Events::Rule
+    Properties:
+      Name: invoke-UpsertGeoIPFunction
+      Description: Ensure we always have the latest GeoIP Database
+      ScheduleExpression: cron(15 20 * * ? *)
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt UpsertGeoIPFunction.Arn
+          Id: invoke-UpsertGeoIPFunction
+
+  InvokeUpsertGeoIPPermission:
+    Condition: CreateNonDevResources
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpsertGeoIPFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvokeUpsertGeoIPFunction.Arn
+
+  IterableSyncAppSubscriptionsFunction:
+    Condition: CreateNonDevResources
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: iterable/subscription-status/
+      Description: Sync User app subscription status with Iterable
+      Environment:
+        Variables:
+          ADMIN_USERNAME: "{{resolve:ssm:ADMIN_USERNAME:1}}"
+          ADMIN_PASSWORD: "{{resolve:ssm:ADMIN_PASSWORD:1}}"
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          ENVIRONMENT: !Ref Environment
+          ITERABLE_API_KEY: "{{resolve:ssm:ITERABLE_API_KEY:1}}"
+      Events:
+        Invoke:
+          Type: Schedule
+          Properties:
+            Schedule: !If ["IsProduction", "cron(0 * ? * * *)", "cron(0 18 * * ? *)"]
+            Enabled: True
+      FunctionName: IterableSyncAppSubscriptions
+      Handler: iterable/subscription-status
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - LambdaInvokePolicy:
+            FunctionName: IterableSyncAppSubscriptions
+      Runtime: go1.x
+      Timeout: 10
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  IterableSyncWeeklyFocusFunction:
+    Condition: CreateNonDevResources
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: iterable/weekly-focus/
+      Description: Sync User current theme week data with Iterable
+      Environment:
+        Variables:
+          ADMIN_USERNAME: "harbor-admin-do-not-delete@helloharbor.com"
+          ADMIN_PASSWORD: "{{resolve:ssm:ADMIN_PASSWORD:1}}"
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          HARBOR_API_BASE_URL: !Sub
+            - https://api.${env}.helloharbor.com
+            - env: !Ref Environment
+          HARBOR_API2_BASE_URL: !Sub
+            - https://api2.${env}.helloharbor.com
+            - env: !Ref Environment
+          ITERABLE_API_KEY: "{{resolve:ssm:ITERABLE_API_KEY:1}}"
+      Events:
+        Invoke:
+          Type: Schedule
+          Properties:
+            Schedule: !If ["IsProduction", "cron(0 * ? * * *)", "cron(0 18 * * ? *)"]
+            Enabled: True
+      FunctionName: IterableSyncWeeklyFocus
+      Handler: iterable/weekly-focus
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - LambdaInvokePolicy:
+            FunctionName: IterableSyncWeeklyFocus
+      Runtime: go1.x
+      Timeout: 10
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  IterableSyncUserFunction:
+    Condition: CreateNonDevResources
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: iterable/user/
+      Description: Sync User data with Iterable
+      Environment:
+        Variables:
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          ITERABLE_API_KEY: "{{resolve:ssm:ITERABLE_API_KEY:1}}"
+      FunctionName: IterableSyncUser
+      Handler: iterable/user
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+
+  IPAWSIngestFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws/ingest/
+      Description: ingest ipaws data
+      Events:
+        Invoke:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0/2 * * * ? *)
+            Enabled: True
+      Environment:
+        Variables:
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          BUCKET_NAME: !Sub
+            - ${env}-titicaca
+            - env: !Ref Environment
+          REDIS_URL: "{{resolve:ssm:REDIS_URL:1}}"
+          REDIS_ALERT_QUEUE_KEY: "alert-queue"
+          ALERT_QUEUE_MAX_DEPTH: 1000
+          IPAWS_SNS_ARN: !Ref IPAWSAlertTopic
+      FunctionName: IPAWSIngest
+      Handler: ingest
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-titicaca
+              - env: !Ref Environment
+        - SNSPublishMessagePolicy:
+            TopicName:
+              !GetAtt IPAWSAlertTopic.TopicName
+        - LambdaInvokePolicy:
+            FunctionName: IPAWSlackAlertsFunction
+      Runtime: go1.x
+      Timeout: 20
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, RDS ]
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+
+  IPAWSAlertNotifierFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws/alert-notifier/
+      Description: ipaws alert notifier
+      FunctionName: IPAWSAlertNotifier
+      Handler: alert-notifier
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - SNSPublishMessagePolicy:
+            TopicName:
+              !GetAtt IPAWSNotificationTopic.TopicName
+      Environment:
+        Variables:
+          REDIS_URL: "{{resolve:ssm:REDIS_URL:1}}"
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          REDIS_RO_DB_KEY: "ro_db_conn_str"
+          ITERABLE_API_KEY: "{{resolve:ssm:ITERABLE_API_KEY:2}}"
+          LAMBDA_ENV: !Ref Environment
+          NOTIFICATIONS_SNS_ARN: !Ref IPAWSNotificationTopic
+      Runtime: go1.x
+      Timeout: 20
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, RDS ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, Redis ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+      Events:
+        IPAWSAlert:
+          Type: SNS
+          Properties:
+            Topic:
+              !Ref IPAWSAlertTopic
+
+  IPAWSlackAlertsFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws/slackbot/
+      Description: slackbot for ipaws ingest data
+      FunctionName: IPAWSSlackbot
+      Handler: slackbot
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-titicaca
+              - env: !Ref Environment
+      Environment:
+        Variables:
+          REDIS_URL: "{{resolve:ssm:REDIS_URL:1}}"
+          REDIS_ALERT_QUEUE_KEY: "alert-queue"
+          REDIS_RO_DB_KEY: "ro_db_conn_str"
+          SLACKBOT_ENV: !Ref Environment
+      Runtime: go1.x
+      Timeout: 20
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, RDS ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, Redis ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+      Events:
+        IPAWSAlert:
+          Type: SNS
+          Properties:
+            Topic:
+              !Ref IPAWSAlertTopic
+
+  IPAWSAlertTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: 'ipaws-alert-topic'
+      TopicName: 'IPAWSAlertTopic'
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt IPAWSlackAlertsFunction.Arn
+        - Protocol: lambda
+          Endpoint: !GetAtt IPAWSAlertNotifierFunction.Arn
+
+  IPAWSNotificationTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: 'ipaws-notification-topic'
+      TopicName: IPAWSNotificationTopic
