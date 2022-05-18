@@ -1,0 +1,1342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  harbor-backend-serverless
+
+  Template for harbor-backend-serverless
+
+Globals:
+  Function:
+    Timeout: 5
+
+Mappings:
+  EFSAccessPoints:
+    development:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:723646754367:access-point/fsap-0ebaa5758e1b9f711
+    staging:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:703075173256:access-point/fsap-075ba46d019c2f9df
+    production:
+      PrivNatLarge: arn:aws:elasticfilesystem:us-west-1:612422893098:access-point/fsap-0cdb40148dffb3c53
+  PrivSubnets:
+    development:
+      Subnet1: subnet-03e4097903948eed2
+      Subnet2: subnet-0f46e895695683b39
+    staging:
+      Subnet1: subnet-0dec2960e6589fa82
+      Subnet2: subnet-098597c2043c8721a
+    production:
+      Subnet1: subnet-01d593234f12a5b6d
+      Subnet2: subnet-081269219444d9522
+  PrivNATSubnets:
+    development:
+      Subnet1: subnet-09f5fa13c97ffcc8a
+      Subnet2: subnet-0814cdc8489cf2eae
+      Subnet1Large: subnet-017b90a035ebb96a9
+      Subnet2Large: subnet-09059c8d23c33f101
+    staging:
+      Subnet1: subnet-05688a431e6f1034c
+      Subnet2: subnet-04899d6c93ae8e8e5
+      Subnet1Large: subnet-0e749513831b924dd
+      Subnet2Large: subnet-0b6f9ea44f92c7d87
+    production:
+      Subnet1: subnet-0e75173d5a6ff5746
+      Subnet2: subnet-0cf5941eb658ad58e
+      Subnet1Large: subnet-054b0d6d76f10b27a
+      Subnet2Large: subnet-007d64664a23a79c7
+  S3HazardHubRiskProfilesUploadRoles:
+    development:
+      policy: arn:aws:iam::723646754367:policy/S3HazardHubRiskProfiles
+    staging:
+      policy: arn:aws:iam::703075173256:policy/S3HazardHubRiskProfiles
+    production:
+      policy: arn:aws:iam::612422893098:policy/S3HazardHubRiskProfiles
+  SecurityGroups:
+    development:
+      EFS: sg-00478bcadabad640c
+      NAT: sg-08e4b82ffd2daa5f7
+      NAT2: sg-08e4b82ffd2daa5f7
+      RDS: sg-012f232f97bce976f
+      Redis: sg-0dfe80630b14340a6
+    staging:
+      EFS: sg-026d2e2ef75cbf7ee
+      NAT: sg-0d8bd51a2eb73f8dc
+      NAT2: sg-0d8bd51a2eb73f8dc
+      RDS: sg-0e13bc70e8acbcdca
+      Redis: sg-0da6a248f808afd9d
+    production:
+      EFS: sg-0aaa279858a710e39
+      NAT: sg-0634dd96462640292
+      NAT2: sg-07b6ff1b0e820468e
+      RDS: sg-0559c0492f0fa4e79
+      Redis: sg-0ea1ab313c828762c
+  LegacyS3Buckets:
+    development:
+      backend: harbor-development
+    staging:
+      backend: harbor-staging-s3
+    production:
+      backend: harbor-production
+
+Parameters:
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Enter development, staging, or production. Default is development.
+
+Resources:
+  AnalyticsEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: analytics-events/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          ENVIRONMENT: !Ref Environment
+          ITERABLE_API_KEY: "{{resolve:ssm:ITERABLE_API_KEY:1}}"
+      Events:
+        BeginSession:
+          Type: Api
+          Properties:
+            Method: post
+            Path: /analytics-events/begin-session
+            RestApiId: !Ref Api2
+        EndSession:
+          Type: Api
+          Properties:
+            Method: post
+            Path: /analytics-events/end-session
+            RestApiId: !Ref Api2
+        Post:
+          Type: Api
+          Properties:
+            Method: post
+            Path: /analytics-events
+            RestApiId: !Ref Api2
+      FunctionName: AnalyticsEvents
+      Handler: analytics-events
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 10
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetChapterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: chapters/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: GetChapter
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /chapters/{id}
+            RestApiId: !Ref Api2
+      Handler: chapters
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  GooglePlacesAutocompleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: google-places/autocomplete/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          GEO_API_KEY: '{{resolve:ssm:GEO_API_KEY:1}}'
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      Events:
+        GetByText:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /places/autocomplete
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.text
+              - method.request.querystring.origin
+      FileSystemConfigs:
+        - Arn: !FindInMap [EFSAccessPoints, !Ref Environment, PrivNatLarge]
+          LocalMountPath: "/mnt/efs"
+      FunctionName: GooglePlacesAutocomplete
+      Handler: google-places/autocomplete
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - AmazonElasticFileSystemClientFullAccess
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, EFS]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  GooglePlacesDetailsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: google-places/details/
+      Environment:
+        Variables:
+          GEO_API_KEY: '{{resolve:ssm:GEO_API_KEY:1}}'
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /places/{id}
+            RestApiId: !Ref Api2
+      FunctionName: GooglePlacesDetails
+      Handler: google-places/details
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  GooglePlacesNearbyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: google-places/nearby/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          GEO_API_KEY: '{{resolve:ssm:GEO_API_KEY:1}}'
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /places/nearby
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.keyword
+              - method.request.querystring.origin
+              - method.request.querystring.type
+      FileSystemConfigs:
+        - Arn: !FindInMap [EFSAccessPoints, !Ref Environment, PrivNatLarge]
+          LocalMountPath: "/mnt/efs"
+      FunctionName: GooglePlacesNearby
+      Handler: google-places/nearby
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - AmazonElasticFileSystemClientFullAccess
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, EFS]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  FormInputAnswerCreateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: form-inputs/answers/post/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          ENVIRONMENT: !Ref Environment
+          ITERABLE_EVENT_URL: "https://api.iterable.com/api/events/track?api_key={{resolve:ssm:ITERABLE_API_KEY:1}}"
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: FormInputAnswerCreate
+      Events:
+        Post:
+          Type: Api
+          Properties:
+            Method: post
+            Path: /form-input-answers
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.maxPlanBuilderVersion
+      Handler: form-inputs/answers/post
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  FormInputAnswerUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: form-inputs/answers/patch/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          ENVIRONMENT: !Ref Environment
+          ITERABLE_EVENT_URL: "https://api.iterable.com/api/events/track?api_key={{resolve:ssm:ITERABLE_API_KEY:1}}"
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: FormInputAnswerUpdate
+      Events:
+        LegacyPatch:
+          Type: Api
+          Properties:
+            Method: patch
+            Path: /form-input-answers/{answerID}
+            RestApiId: !Ref Api2
+        Patch:
+          Type: Api
+          Properties:
+            Method: patch
+            Path: /plans/{planID}/form-input-answers/{answerID}
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.maxPlanBuilderVersion
+      Handler: form-inputs/answers/patch
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  PatchAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: addresses/patch/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          HARBOR_GEO_RISK_PROFILE_URL: !Sub
+            - 'https://pub-api.${env}.helloharbor.com/risk-profile/byCoordinates'
+            - env: !Ref Environment
+      Events:
+        Patch:
+          Type: Api
+          Properties:
+            Method: patch
+            Path: /addresses/{addressID}
+            RestApiId: !Ref Api2
+      FunctionName: PatchAddress
+      Handler: addresses/patch
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WeeklyScheduleUpsertFunction
+      Runtime: go1.x
+      Timeout: 15
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1Large]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2Large]
+
+  UpdateAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: addresses/update/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          HARBOR_RISK_PROFILE_URL: !Sub
+            - 'https://pub-api.${env}.helloharbor.com/risk-profile'
+            - env: !Ref Environment
+      Events:
+        UpdateAddress:
+          Type: Api
+          Properties:
+            Method: patch
+            Path: /addresses/update
+            RestApiId: !Ref Api2
+      FunctionName: UpdateAddress
+      Handler: addresses/update
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WeeklyScheduleUpsertFunction
+      Runtime: go1.x
+      Timeout: 15
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  LibraryRisksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: risks/library/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: LibraryRisks
+      Events:
+        GetLibraryRisks:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/library
+            RestApiId: !Ref Api2
+      Handler: risks/library
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  GetLibraryRisksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: legacy-library-risks/
+      Description: Legacy handler for Node /library/risks endpoint, delete when possible
+      Environment:
+        Variables:
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          HAZARD_HUB_AUTH: !Sub
+            - 'Token token=${token}'
+            - token: '{{resolve:ssm:HAZARD_HUB_API_TOKEN:1}}'
+          HAZARD_HUB_URL: https://api.hazardhub.com/v1/risks
+          PARSED_BUCKET: !Sub
+            - '${env}-parsed-hazard-hub-risk-profiles'
+            - env: !Ref Environment
+          RAW_BUCKET: !Sub
+            - '${env}-hazard-hub-risk-profiles'
+            - env: !Ref Environment
+      FunctionName: GetLibraryRisks
+      Handler: legacy-library-risks
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - S3ReadPolicy:
+            BucketName: !Sub
+              - '${env}-hazard-hub-risk-profiles'
+              - env: !Ref Environment
+        - S3ReadPolicy:
+            BucketName: !Sub
+              - '${env}-parsed-hazard-hub-risk-profiles'
+              - env: !Ref Environment
+        - S3WritePolicy:
+            BucketName: !Sub
+              - '${env}-hazard-hub-risk-profiles'
+              - env: !Ref Environment
+        - S3WritePolicy:
+            BucketName: !Sub
+              - '${env}-parsed-hazard-hub-risk-profiles'
+              - env: !Ref Environment
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  Api2:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: '{{resolve:ssm:ENVIRONMENT:1}}'
+      Auth:
+        DefaultAuthorizer: JWTAuthorizerFunction
+        Authorizers:
+          JWTAuthorizerFunction:
+            FunctionArn: !GetAtt JWTAuthorizerFunction.Arn
+            FunctionPayloadType: TOKEN
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 0
+
+  GetOnboardingRisksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: risks/onboarding/
+      Environment:
+        Variables:
+          DB_HOST: '{{resolve:ssm:BACKEND_DB_HOST:1}}'
+          DB_NAME: postgres
+          DB_PASSWORD: '{{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}'
+          DB_PORT: 5432
+          DB_USER: '{{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}'
+          SSL_MODE: require
+      FunctionName: GetOnboardingRisks
+      Events:
+        GetOnboardingRisks:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/onboarding
+            RestApiId: !Ref Api2
+        PingOnboardingRisks:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/onboarding-ping
+            RestApiId: !Ref Api2
+      Handler: risks/onboarding
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  JWTAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: jwt-authorizer/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          PEPPER: '{{resolve:ssm:PEPPER:1}}'
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: JWTAuthorizer
+      Handler: jwt-authorizer
+      Policies:
+        - AmazonSNSFullAccess
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  OTPSMSGenerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: otp/generation/
+      Events:
+        GenerateOTP:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api2
+            Path: /otp/generate
+            Method: post
+      Environment:
+        Variables:
+          TWILIO_SID: '{{resolve:ssm:TWILIO_SID:1}}'
+          TWILIO_TOKEN: '{{resolve:ssm:TWILIO_TOKEN:1}}'
+      FunctionName: OTPSMSGeneration
+      Handler: otp/generation
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AmazonSNSFullAccess
+        - DynamoDBWritePolicy:
+            TableName: tokens
+      Runtime: go1.x
+      Tracing: Active
+
+  OTPVerificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: otp/verification/
+      Events:
+        VerifyOTP:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api2
+            Path: /otp/verify
+            Method: post
+      FunctionName: OTPVerification
+      Handler: otp/verification
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - DynamoDBReadPolicy:
+            TableName: tokens
+      Runtime: go1.x
+      Tracing: Active
+
+  GetRiskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: risks/get/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: GetRisk
+      Events:
+        GetRisk:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/{id}
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.maxPlanBuilderVersion
+      Handler: risks/get
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetThemeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: themes/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: GetTheme
+      Events:
+        GetTheme:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /themes/{id}
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.maxPlanBuilderVersion
+      Handler: themes
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetThemeWeeksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: activities/theme-weeks/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: GetThemeWeeks
+      Events:
+        GetThemeWeeks:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /activities/theme-weeks
+            RequestParameters:
+              - method.request.querystring.userID
+            RestApiId: !Ref Api2
+      Handler: activities/theme-weeks
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetTodayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: today/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      FunctionName: GetToday
+      Events:
+        GetToday:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /today
+            RestApiId: !Ref Api2
+            RequestParameters:
+              - method.request.querystring.userID
+              - method.request.querystring.maxPlanBuilderVersion
+      Handler: today
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WeeklyScheduleUpsertFunction
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, Redis]
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  ActivitiesSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: activities/summary/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: ActivitiesSummary
+      Events:
+        GetActivitiesSummary:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /activities/summary
+            RestApiId: !Ref Api2
+      Handler: activities/summary
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  GetHouseholdInfoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: households/get/
+      Environment:
+        Variables:
+          DB_CONN: >-
+            user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+            port=5432
+            dbname=postgres
+            sslmode=require
+            host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+            password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          DOCUMENTS_URL: !Sub
+            - https://api.${env}.helloharbor.com/v1/auth/documents
+            - env: !Ref Environment
+          SAFE_LOCATIONS_URL: !Sub
+            - https://api.${env}.helloharbor.com/v1/auth/safe-locations
+            - env: !Ref Environment
+      FunctionName: GetHouseholdInfo
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /households
+            RestApiId: !Ref Api2
+      Handler: households/get
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: inventories/get/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: GetInventory
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /inventories/{id}
+            RestApiId: !Ref Api2
+      Handler: inventories/get
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  ListInventoriesByCategoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: inventories/list-by-category/
+      Environment:
+        Variables:
+          S3_KEY_ID: "{{resolve:ssm:S3_KEY_ID:1}}"
+          S3_ACCESS_KEY: "{{resolve:ssm:S3_ACCESS_KEY:1}}"
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          BACKEND_S3_BUCKET: !FindInMap [LegacyS3Buckets, !Ref Environment, backend]
+      FunctionName: ListInventoriesByCategory
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /inventories/by-category/{id}
+            RestApiId: !Ref Api2
+      Handler: inventories/list-by-category
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+        - S3ReadPolicy:
+            BucketName: !FindInMap [LegacyS3Buckets, !Ref Environment, backend]
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  RisksReadinessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: risks/readiness/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: RisksReadiness
+      Events:
+        GetRisksReadiness:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/readiness
+            RestApiId: !Ref Api2
+      Handler: risks/readiness
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  RisksSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: risks/summary/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: RisksSummary
+      Events:
+        GetRisksSummary:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /risks/summary
+            RestApiId: !Ref Api2
+      Handler: risks/summary
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  USPSGetCityStateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: usps-city-state-lookup/
+      Environment:
+        Variables:
+          USPS_USER_ID: '{{resolve:ssm:USPS_USER_ID:1}}'
+      FunctionName: USPSGetCityState
+      Handler: usps-city-state-lookup
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+      Runtime: go1.x
+      Tracing: Active
+
+  ZipcodeLocationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: zipcode-location/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+          INTERNAL_AUTH_TOKEN: '{{resolve:ssm:INTERNAL_AUTH_TOKEN:1}}'
+          USPS_USER_ID: '{{resolve:ssm:USPS_USER_ID:1}}'
+          USPS_URL: https://secure.shippingapis.com/ShippingAPI.dll
+      Events:
+        GetZipcodeLocation:
+          Type: Api
+          Properties:
+            Auth:
+              Authorizer: NONE
+            Method: get
+            Path: /zipcode-location/{authToken}/{zipcode}
+            RestApiId: !Ref Api2
+      FunctionName: ZipcodeLocation
+      Handler: zipcode-location
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT]
+          - !FindInMap [SecurityGroups, !Ref Environment, NAT2]
+        SubnetIds:
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivNATSubnets, !Ref Environment, Subnet2]
+
+  GetWeatherEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: weather-events/get
+      Environment:
+        Variables:
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /weather-events/get/{id}
+            RestApiId: !Ref Api2
+      Handler: weather-events/get
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, Redis ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+
+  GetAllWeatherEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: weather-events/get-all
+      Environment:
+        Variables:
+          REDIS_URL: '{{resolve:ssm:REDIS_URL:1}}'
+          REDIS_ALL_EVENTS_KEY: 'alert-queue'
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /weather-events/get-all
+            RequestParameters:
+              - method.request.querystring.latlong
+            RestApiId: !Ref Api2
+      Handler: weather-events/get-all
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, Redis ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+
+  WeeklyScheduleUpsertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: weekly-schedules/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: WeeklyScheduleUpsert
+      Events:
+        Put:
+          Type: Api
+          Properties:
+            Method: put
+            Path: /weekly-schedules
+            RestApiId: !Ref Api2
+      Handler: weekly-schedules
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  GetEmergencyGuidesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: emergency-guides/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: GetEmergencyGuides
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /emergency-guides
+            RestApiId: !Ref Api2
+      Handler: emergency-guides
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+  GetSuppliesSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: supplies/
+      Environment:
+        Variables:
+          DB_CONN: >-
+             user={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:username}}
+             port=5432
+             dbname=postgres
+             sslmode=require
+             host={{resolve:ssm:BACKEND_RO_DB_HOST:1}}
+             password={{resolve:secretsmanager:BACKEND_DB_CREDENTIALS:SecretString:password}}
+      FunctionName: GetSuppliesSummary
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Method: get
+            Path: /supplies/summary
+            RestApiId: !Ref Api2
+      Handler: supplies
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - AWSLambdaVPCAccessExecutionRole
+      Runtime: go1.x
+      Timeout: 5
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [SecurityGroups, !Ref Environment, RDS]
+        SubnetIds:
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet1]
+          - !FindInMap [PrivSubnets, !Ref Environment, Subnet2]
+
+Outputs:
+  JWTAuthorizerFunctionArn:
+    Value: !GetAtt JWTAuthorizerFunction.Arn
+    Export:
+      Name: JWTAuthorizerFunctionArn
+  WeeklyScheduleUpsertFunctionName:
+    Value: !Ref WeeklyScheduleUpsertFunction
+    Export:
+      Name: WeeklyScheduleUpsertFunctionName

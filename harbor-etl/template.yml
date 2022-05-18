@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: SAM Template for Harbor ETL
+
+Transform: "AWS::Serverless-2016-10-31"
+
+Mappings:
+  PrivSubnets:
+    development:
+      Subnet1: subnet-03e4097903948eed2
+      Subnet2: subnet-0f46e895695683b39
+    staging:
+      Subnet1: subnet-0dec2960e6589fa82
+      Subnet2: subnet-098597c2043c8721a
+    production:
+      Subnet1: subnet-01d593234f12a5b6d
+      Subnet2: subnet-081269219444d9522
+  PrivNATSubnets:
+    development:
+      Subnet1: subnet-058f60aaa39abd0c9
+      Subnet2: subnet-0158e5f2097bdfb0d
+    staging:
+      Subnet1: subnet-05688a431e6f1034c
+      Subnet2: subnet-04899d6c93ae8e8e5
+    production:
+      Subnet1: subnet-0e75173d5a6ff5746
+      Subnet2: subnet-0cf5941eb658ad58e
+  SecurityGroups:
+    development:
+      NAT: sg-08e4b82ffd2daa5f7
+      NAT2: sg-08e4b82ffd2daa5f7
+      RDS: sg-012f232f97bce976f
+      Redis: sg-0dfe80630b14340a6
+    staging:
+      NAT: sg-0d8bd51a2eb73f8dc
+      NAT2: sg-0d8bd51a2eb73f8dc
+      RDS: sg-0e13bc70e8acbcdca
+      Redis: sg-0da6a248f808afd9d
+    production:
+      NAT: sg-0634dd96462640292
+      NAT2: sg-07b6ff1b0e820468e
+      RDS: sg-0559c0492f0fa4e79
+      Redis: sg-0ea1ab313c828762c
+  SNSTopics:
+    development:
+      IPAWSNotificationTopic: arn:aws:sns:us-west-1:723646754367:IPAWSNotificationTopic
+  StepFunctions:
+    development:
+      IPAWSBeaconNotificationStepFunctionArn: arn:aws:states:us-west-1:723646754367:stateMachine:IPAWS_Beacon_Notifications
+      IPAWSBeaconNotificationStepFunctionName: IPAWS_Beacon_Notifications
+Parameters:
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Enter development, staging, or production. Default is development.
+
+Resources:
+  IPAWSExtractAlerts:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_alerts/
+      Description: IPAWS extract
+      Environment:
+        Variables:
+          DYNAMO_ALERTS_TABLE: "ipaws_extractor_lookup"
+          IPAWS_URL: "{{resolve:ssm:IPAWS_URL:1}}"
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSExtractorAlerts
+      Handler: fetch.extract_feed
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+        - DynamoDBCrudPolicy:
+            TableName: "ipaws_extractor_lookup"
+      Runtime: python3.9
+      Timeout: 20
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
+
+  IPAWSPrepSnowpipeAlerts:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_alerts/
+      Description: IPAWS prep for snowpipe ingestion
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSPrepSnowpipeAlerts
+      Handler: prep_snowpipe.prep_pipe
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 20
+      Tracing: Active
+
+  IPAWSLoadSnowpipeAlerts:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_alerts/
+      Description: IPAWS prep for snowpipe ingestion
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSLoadSnowpipeAlerts
+      Handler: load_snowpipe.load_pipe
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 600
+      Tracing: Active
+
+  IPAWSBackfillSnowflakeAlerts:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_alerts/
+      Description: IPAWS backfill for snowflake alerts
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSBackfillSnowflakeAlerts
+      Handler: backfill_snowflake.backfill
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 20
+      Tracing: Active
+
+  IPAWSIngestBeaconNotifications:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_notifications
+      Description: Fetching notifications from IPAWS notification SNS and store in Baikal
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSIngestBeaconNotifications
+      Handler: ingestor.ingest
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 20
+      Tracing: Active
+
+  IPAWSPrepSnowpipeNotifications:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_notifications/
+      Description: IPAWS notification prep for snowpipe ingestion
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSPrepSnowpipeNotifications
+      Handler: prep_snowpipe.prep_pipe
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 20
+      Tracing: Active
+
+  IPAWSLoadSnowpipeNotifications:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_notifications/
+      Description: IPAWS prep for snowpipe ingestion of notifications
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSLoadSnowpipeNotifications
+      Handler: load_snowpipe.load_pipe
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 600
+      Tracing: Active
+
+  IPAWSBackfillSnowflakeNotifications:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_notifications/
+      Description: IPAWS backfill for snowflake notifications
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      FunctionName: IPAWSBackfillSnowflakeNotifications
+      Handler: backfill_snowflake.backfill
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3CrudPolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 600
+      Tracing: Active
+
+  IPAWSKickstartNotifications:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ipaws_notifications/
+      Description: IPAWS kickstart notifications step function
+      Environment:
+        Variables:
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+          STATE_MACHINE_ARN: !FindInMap [ StepFunctions, !Ref Environment, IPAWSBeaconNotificationStepFunctionArn ]
+      FunctionName: IPAWSKickstartNotifications
+      Handler: kickstart_step_function.kickstart
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !FindInMap [ StepFunctions, !Ref Environment, IPAWSBeaconNotificationStepFunctionName ]
+      Runtime: python3.9
+      Timeout: 30
+      Tracing: Active
+      Events:
+        IPAWSNotification:
+          Type: SNS
+          Properties:
+            Topic: !FindInMap [ SNSTopics, !Ref Environment, IPAWSNotificationTopic ]
+            SqsSubscription: true
+
+  SnapshotFanout:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: snapshots/
+      Description: snapshot fanout seed step function
+      FunctionName: SnapshotFanout
+      Handler: fanout.fanout
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+      Runtime: python3.9
+      Timeout: 30
+      Tracing: Active
+
+  SnapshotFetchTable:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: snapshots/
+      Description: snapshot table fetch from sf parallel
+      FunctionName: SnapshotFetch
+      Handler: fetch_table.fetch_table
+      Environment:
+        Variables:
+          DB_HOST: "{{resolve:ssm:BACKEND_RO_DB_HOST:4}}"
+          DB_DBNAME: "postgres"
+          DB_USER: "harbor"
+          DB_PASS: "{{resolve:ssm:BACKEND_RO_DB_PASSWORD:1}}"
+          DB_PORT: "5432"
+          ETL_BUCKET: !Sub
+            - ${env}-baikal
+            - env: !Ref Environment
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - S3WritePolicy:
+            BucketName: !Sub
+              - ${env}-baikal
+              - env: !Ref Environment
+      Runtime: python3.9
+      Timeout: 900
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !FindInMap [ SecurityGroups, !Ref Environment, Redis ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, RDS ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT ]
+          - !FindInMap [ SecurityGroups, !Ref Environment, NAT2 ]
+        SubnetIds:
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet1 ]
+          - !FindInMap [ PrivNATSubnets, !Ref Environment, Subnet2 ]
